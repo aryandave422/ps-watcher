@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""PlayStation INR Gift Card stock watcher (GitHub Actions version)."""
+"""PlayStation INDIA gift card stock watcher."""
 import json
 import os
 import random
 import re
+import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from urllib.parse import quote_plus, urljoin, urlparse
@@ -14,7 +16,8 @@ from bs4 import BeautifulSoup
 
 STATE_FILE = "state.json"
 WATCH_FILE = "watch.txt"
-MAX_PRODUCTS_PER_SITE = 12
+MAX_PRODUCTS_PER_SITE = 25
+STRICT_INDIA = True  # True: sirf wahi cards jinme India/INR/Rs likha ho
 
 SITES = {
     "MD Computers": "https://mdcomputers.in",
@@ -53,12 +56,23 @@ SEARCH_PATTERNS = [
     "/catalogsearch/result/?q={q}",
     "/search/?q={q}",
 ]
-QUERY = "playstation gift card"
+QUERY = "playstation gift card india"
 
-LINK_RE_PS = re.compile(r"playstation|psn|ps[\s-]?store|ps[\s-]?plus", re.I)
+LINK_RE_PS = re.compile(r"playstation|psn|ps[\s-]?store", re.I)
 LINK_RE_CARD = re.compile(r"gift|card|wallet|voucher|top[\s-]?up", re.I)
-OUT_RE = re.compile(r"out of stock|sold out|currently unavailable|notify me|temporarily unavailable", re.I)
+OUT_RE = re.compile(
+    r"out of stock|sold out|currently unavailable|notify me|temporarily unavailable", re.I
+)
 IN_RE = re.compile(r"add to cart|add to bag|buy now|add to basket", re.I)
+
+FOREIGN_RE = re.compile(
+    r"\b(?:us|usa|america|american|united states|uk|united kingdom|uae|emirates|"
+    r"saudi|ksa|canada|canadian|australia|aus|europe|eu|euro|germany|france|spain|"
+    r"italy|japan|singapore|turkey|brazil|mexico|korea|hong kong|usd|gbp|eur|aed|"
+    r"cad|aud|dollar|dollars)\b|[$£€]",
+    re.I,
+)
+INDIA_RE = re.compile(r"\b(?:india|indian|inr)\b|₹|\brs\.?\s?\d", re.I)
 
 HEADERS = {
     "User-Agent": (
@@ -75,15 +89,30 @@ def log(msg):
     print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
 
 
-def fetch(url, timeout=20):
+def fetch(url, timeout=12):
     try:
         r = session.get(url, timeout=timeout, allow_redirects=True)
         if r.status_code == 200:
             return r.text
-        log(f"  HTTP {r.status_code}: {url}")
+        log(f"  HTTP {r.status_code}: {url[:90]}")
     except requests.RequestException as e:
-        log(f"  error {type(e).__name__}: {url}")
+        log(f"  error {type(e).__name__}: {url[:90]}")
     return None
+
+
+def url_words(url):
+    path = urlparse(url).path
+    return re.sub(r"[-_/]+", " ", path)
+
+
+def region_ok(title, url):
+    """India card hai ya nahi. Returns (ok, reason)."""
+    blob = f"{title} {url_words(url)}"
+    if FOREIGN_RE.search(blob):
+        return False, "foreign region"
+    if STRICT_INDIA and not INDIA_RE.search(blob):
+        return False, "India nahi likha"
+    return True, ""
 
 
 def discover(base):
@@ -95,10 +124,10 @@ def discover(base):
             continue
         soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
-            text = a.get_text(" ", strip=True) + " " + a["href"]
+            text = a.get_text(" ", strip=True) + " " + url_words(a["href"])
             if LINK_RE_PS.search(text) and LINK_RE_CARD.search(text):
                 url = urljoin(base, a["href"]).split("#")[0]
-                if urlparse(url).netloc.endswith(host):
+                if urlparse(url).netloc.replace("www.", "").endswith(host):
                     found[url] = True
         if found:
             break
@@ -117,7 +146,8 @@ def _walk_offers(node):
                 yield from _walk_offers(v)
 
 
-def check_product(url):
+def check_product(url, india_only=True):
+    """Returns dict(title, price, in_stock) ya None (fail / filter)."""
     html = fetch(url)
     if not html:
         return None
@@ -126,8 +156,15 @@ def check_product(url):
     title = (og.get("content") if og else None) or (
         soup.title.string.strip() if soup.title and soup.title.string else url
     )
-    price, in_stock = None, None
+    title = " ".join(title.split())[:120]
 
+    if india_only:
+        ok, reason = region_ok(title, url)
+        if not ok:
+            log(f"  skip ({reason}): {title[:70]}")
+            return None
+
+    price, currency, in_stock = None, None, None
     for s in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(s.string or "")
@@ -140,6 +177,7 @@ def check_product(url):
             elif in_stock is None and re.search(r"OutOfStock|SoldOut|Discontinued", av):
                 in_stock = False
             price = price or offer.get("price")
+            currency = currency or offer.get("priceCurrency")
         if in_stock is not None:
             break
 
@@ -152,14 +190,15 @@ def check_product(url):
         elif OUT_RE.search(text):
             in_stock = False
 
-    return {"title": title[:120], "price": price, "in_stock": in_stock}
+    price_txt = f"{currency or ''} {price}".strip() if price else None
+    return {"title": title, "price": price_txt, "in_stock": in_stock}
 
 
 def notify(text):
     log("ALERT: " + text.replace("\n", " | "))
     token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     if not (token and chat):
-        log("  Telegram secrets set nahi hain")
+        log("  Telegram token/chat id set nahi hai")
         return
     try:
         r = requests.post(
@@ -191,50 +230,63 @@ def site_job(item):
     urls = discover(base)
     results = []
     for u in urls:
-        info = check_product(u)
+        info = check_product(u, india_only=True)
         if info:
             results.append((name, u, info))
         time.sleep(random.uniform(1, 2))
     if not urls:
         log(f"{name}: koi PlayStation gift card link nahi mila")
     else:
-        log(f"{name}: {len(urls)} products mile")
+        log(f"{name}: {len(urls)} links mile, {len(results)} India cards bache")
     return results
 
 
 def manual_job(url):
-    info = check_product(url)
-    return [(urlparse(url).netloc, url, info)] if info else []
+    info = check_product(url, india_only=False)  # watch.txt pe filter nahi
+    name = "watch.txt | " + urlparse(url).netloc.replace("www.", "")
+    return [(name, url, info)] if info else []
 
 
 def main():
+    if "--test" in sys.argv:
+        notify("✅ Test message: PlayStation watcher ka Telegram sahi chal raha hai.")
+        return
+
     state = load_state()
     log("Check shuru...")
     all_results = []
     with ThreadPoolExecutor(max_workers=6) as ex:
         futures = [ex.submit(site_job, it) for it in SITES.items()]
         if os.path.exists(WATCH_FILE):
-            with open(WATCH_FILE) as f:
+            with open(WATCH_FILE, encoding="utf-8") as f:
                 manual = [l.strip() for l in f if l.strip().startswith("http")]
             futures += [ex.submit(manual_job, u) for u in manual]
+            log(f"watch.txt: {len(manual)} links")
         for fut in futures:
             try:
                 all_results += fut.result()
             except Exception as e:
                 log(f"job failed: {e}")
 
-    in_stock_now = 0
+    seen, in_stock_now = set(), 0
     for name, url, info in all_results:
+        if url in seen:
+            continue
+        seen.add(url)
         prev = state.get(url, {}).get("in_stock")
         cur = info["in_stock"]
         if cur:
             in_stock_now += 1
         if cur is True and prev is not True:
-            price = f" @ Rs {info['price']}" if info["price"] else ""
-            notify(f"IN STOCK - {name}\n{info['title']}{price}\n{url}")
+            price = f" @ {info['price']}" if info["price"] else ""
+            notify(f"🎮 IN STOCK - {name}\n{info['title']}{price}\n{url}")
         state[url] = {"in_stock": cur, "title": info["title"]}
     save_state(state)
-    log(f"Done. {len(all_results)} products checked, {in_stock_now} in stock.")
+
+    summary = Counter(n for n, _, _ in all_results)
+    for site in SITES:
+        log(f"SUMMARY {site}: {summary.get(site, 0)} India cards")
+    log(f"Done. {len(seen)} products checked, {in_stock_now} in stock.")
 
 
 if __name__ == "__main__":
