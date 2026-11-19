@@ -1,6 +1,6 @@
 {
  "https://e2zstore.com/category/playstation/psn-india/": {
-  "in_stock": null,
+  "in_stock": true,
   "title": "PSN INDIA (IND) - e2zSTORE"
  },
  "https://gameprex.in/playstation-gift-card/": {
@@ -40,6 +40,10 @@
   "title": "Playstation Gift Card India- Buy Products Online at Best Price in India - All Categories | Flipkart.com"
  },
  "https://www.simplygaming.in/blogs/guides/how-to-buy-redeem-psn-gift-card-india?_pos=23&_sid=09dee424a&_ss=r": {
+  "in_stock": null,
+  "title": "How to Buy and Redeem a PSN Gift Card in India (Step by Step)"
+ },
+ "https://www.simplygaming.in/blogs/guides/how-to-buy-redeem-psn-gift-card-india?_pos=23&_sid=3b47b902c&_ss=r": {
   "in_stock": null,
   "title": "How to Buy and Redeem a PSN Gift Card in India (Step by Step)"
  },
